@@ -1,1 +1,4 @@
 /chromedriver.exe
+.env
+debug/
+C:/src/inflearn/
