@@ -629,9 +629,11 @@ class VideoCrawler:
                 segments = segments[:max_segments]
             elif sources is not None:
                 sources = sources[:max_segments]
+        keep_encrypted = os.getenv("INFLEARN_KEEP_ENCRYPTED", "").strip() == "1"
         videos = []
         fail_shown = 0
         key_cache = {}
+        skip_decrypt_notice_shown = False
         if segments is not None:
             items = segments
         else:
@@ -660,7 +662,11 @@ class VideoCrawler:
             resp = requests.get(url=seg_url, headers=headers)
             if resp.status_code == 200:
                 content = resp.content
-                if key_uri:
+                if key_uri and keep_encrypted:
+                    if not skip_decrypt_notice_shown:
+                        print("암호화된 세그먼트를 복호화 없이 그대로 저장합니다. (INFLEARN_KEEP_ENCRYPTED=1)")
+                        skip_decrypt_notice_shown = True
+                elif key_uri:
                     if AES is None:
                         print("AES 라이브러리가 없어 복호화를 진행할 수 없습니다. (pycryptodome 설치 필요)")
                         return None
