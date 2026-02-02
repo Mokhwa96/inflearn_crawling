@@ -63,6 +63,12 @@ class VideoCrawler:
         self._wait = WebDriverWait(self._driver, 20)
         make_dest_path(DEST_PATH)
 
+    def _safe_ascii(self, text):
+        try:
+            return text.encode("ascii", "backslashreplace").decode("ascii")
+        except Exception:
+            return text
+
     def _dump_debug(self, prefix="login_fail"):
         os.makedirs("debug", exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
@@ -141,6 +147,17 @@ class VideoCrawler:
                         pending.discard(path)
             time.sleep(0.2)
         return cached
+
+    def _find_key_request(self, key_path, timeout=15):
+        end = time.time() + timeout
+        while time.time() < end:
+            for r in self._driver.requests:
+                if "/key/" not in r.url or not r.response:
+                    continue
+                if key_path in r.url:
+                    return r
+            time.sleep(0.2)
+        return None
 
     def _fetch_key_via_browser(self, url):
         try:
@@ -327,7 +344,10 @@ class VideoCrawler:
             if start > idx or idx > end:
                 continue
             print(f'전체 강의 다운로드 {size} 중 {idx + 1}...')
-            self.get_video_from_url(unit_url)
+            ok = self.get_video_from_url(unit_url)
+            if ok is False:
+                print("중단: 현재 강의에서 실패했습니다.")
+                break
 
         print('강좌 다운로드가 모두 완료되었습니다.')
 
@@ -343,7 +363,7 @@ class VideoCrawler:
             self._wait.until(lambda d: d.find_element(By.TAG_NAME, 'video'))
         except Exception:
             print('동영상이 없는 페이지입니다.')
-            return None
+            return False
 
         print('영상 대기 중...', end='\r')
         elapsed = 0
@@ -370,7 +390,7 @@ class VideoCrawler:
                     print(e)
             if elapsed > 30:
                 print('대기 시간이 너무 오래 걸립니다...')
-                return None
+                return False
         print('영상 로드 완료', end='\r')
         # 만약 영상이 재생 중이라면 멈추게 하기.
         try:
@@ -419,13 +439,24 @@ class VideoCrawler:
         course_filename = f'{course_index} - {course_title}.mp4'
         print(f'[{lecture_title} - {course_title}] 강좌를 다운로드합니다.')
         # 파일이 이미 존재한다면 기본적으로 새로 생성하지 않는다.
+        force = os.getenv("INFLEARN_FORCE", "").strip() == "1"
         if os.path.isfile(os.path.join(DEST_PATH, lecture_title, course_filename)) or \
            os.path.isfile(os.path.join(DEST_PATH, lecture_title, raw_filename)):
             print(os.path.join(DEST_PATH, lecture_title, course_filename))
-            print('이미 존재하는 강의입니다. 다운로드하지 않습니다.')
-            return None
+            if not force:
+                print('이미 존재하는 강의입니다. 다운로드하지 않습니다.')
+                return None
+            try:
+                os.remove(os.path.join(DEST_PATH, lecture_title, course_filename))
+            except Exception:
+                pass
+            try:
+                os.remove(os.path.join(DEST_PATH, lecture_title, raw_filename))
+            except Exception:
+                pass
 
         headers = {}
+        session = requests.Session()
         root_url = None
         meta_info_url = None
         sources = None
@@ -484,7 +515,15 @@ class VideoCrawler:
                         headers["Cookie"] = cookie_header
             except Exception:
                 pass
-            resp = requests.get(url=request.url, headers=headers)
+            cookie_jar = {}
+            try:
+                cookie_jar = {c["name"]: c["value"] for c in self._driver.get_cookies()}
+            except Exception:
+                pass
+            session.headers.update(headers)
+            if cookie_jar:
+                session.cookies.update(cookie_jar)
+            resp = session.get(url=request.url, headers=headers)
             try:
                 os.makedirs("debug", exist_ok=True)
                 master_path = os.path.join("debug", f"master_{time.strftime('%Y%m%d_%H%M%S')}.m3u8")
@@ -493,6 +532,9 @@ class VideoCrawler:
                 print("  [M3U8] saved:", master_path)
             except Exception:
                 pass
+            if b"skd://" in resp.content or b"METHOD=SAMPLE" in resp.content:
+                print("DRM 감지: 현재 스트림은 지원하지 않습니다.")
+                return False
             lines = [line for line in resp.content.splitlines() if line]
             if lines:
                 # If this is already a media playlist, use it directly.
@@ -552,7 +594,7 @@ class VideoCrawler:
                             if signed_query and "?" not in candidate:
                                 cand_url += signed_query
                             try:
-                                cand_resp = requests.get(url=cand_url, headers=headers)
+                                cand_resp = session.get(url=cand_url, headers=headers)
                                 if cand_resp.status_code != 200:
                                     continue
                                 dur = self._m3u8_duration(cand_resp.content)
@@ -575,16 +617,16 @@ class VideoCrawler:
             except Exception:
                 pass
             print('root url을 찾을 수 없습니다.')
-            return None
+            return False
         if segments is None and sources is None and not meta_info_url:
             print('m3u8 소스 경로를 찾을 수 없습니다.')
-            return None
+            return False
 
         if sources is None and segments is None:
             meta_url = root_url + meta_info_url
             if signed_query and "?" not in meta_info_url:
                 meta_url += signed_query
-            resp = requests.get(url=meta_url, headers=headers)
+            resp = session.get(url=meta_url, headers=headers)
             try:
                 os.makedirs("debug", exist_ok=True)
                 meta_path = os.path.join("debug", f"meta_{time.strftime('%Y%m%d_%H%M%S')}.m3u8")
@@ -595,7 +637,10 @@ class VideoCrawler:
                 pass
             if resp.status_code != 200:
                 print(resp.text)
-                return None
+                return False
+            if b"skd://" in resp.content or b"METHOD=SAMPLE" in resp.content:
+                print("DRM 감지: 현재 스트림은 지원하지 않습니다.")
+                return False
             # get source url list
             current_key_uri = None
             current_iv = None
@@ -632,6 +677,7 @@ class VideoCrawler:
         videos = []
         fail_shown = 0
         key_cache = {}
+        key_token_cache = {}
         if segments is not None:
             items = segments
         else:
@@ -648,7 +694,14 @@ class VideoCrawler:
             time.sleep(2)
         except Exception:
             pass
+        try:
+            self._driver.execute_script(
+                "var v=document.querySelector('video'); if (v) { v.currentTime=0; v.playbackRate=4.0; v.muted=true; v.play(); }"
+            )
+        except Exception:
+            pass
         key_cache.update(self._prefetch_keys(key_paths, timeout=10))
+        last_key_log = None
         for idx, (src, key_uri, iv) in enumerate(items):
             print(f'영상 다운로드 중... ({idx / len(items) * 100:<4.1f}%)', end='\r')
             if src.startswith("http"):
@@ -657,68 +710,132 @@ class VideoCrawler:
                 seg_url = root_url + src
             if signed_query and "?" not in src:
                 seg_url += signed_query
-            resp = requests.get(url=seg_url, headers=headers)
+            resp = session.get(url=seg_url, headers=headers)
             if resp.status_code == 200:
                 content = resp.content
                 if key_uri:
                     if AES is None:
                         print("AES 라이브러리가 없어 복호화를 진행할 수 없습니다. (pycryptodome 설치 필요)")
-                        return None
+                        return False
                     key_url = key_uri if key_uri.startswith("http") else (root_url + key_uri)
                     key_headers = headers
                     key_req = None
+                    key = None
                     try:
                         key_path = urlsplit(key_url).path
+                        key_base = "/".join(key_path.split("/")[:3]) if key_path else ""
+                        if key_base:
+                            token = key_token_cache.get(key_base)
+                            if not token:
+                                for r in reversed(self._driver.requests):
+                                    if key_base in r.url and "key=" in r.url and getattr(r.response, "status_code", None) == 200:
+                                        m = re.search(r"[?&]key=([^&]+)", r.url)
+                                        if m:
+                                            token = m.group(1)
+                                            key_token_cache[key_base] = token
+                                            break
+                            if token and "key=" not in key_url:
+                                joiner = "&" if "?" in key_url else "?"
+                                key_url += f"{joiner}key={token}"
+                        if key_path and key_path != last_key_log:
+                            print(f"\n  [KEY] path: {self._safe_ascii(key_path)}")
+                            last_key_log = key_path
                         if key_path in key_cache:
                             key = key_cache.get(key_path)
                         else:
-                            end_wait = time.time() + 5
-                            while time.time() < end_wait and key_req is None:
-                                key_req = next(
-                                    (r for r in self._driver.requests
-                                     if "/key/" in r.url and key_path in r.url and r.response),
-                                    None
-                                )
-                                if key_req is None:
-                                    time.sleep(0.2)
+                            key_req = self._find_key_request(key_path, timeout=15)
                             if key_req:
                                 key_url = key_req.url
                                 key_headers = {**headers, **key_req.headers}
+                                if key_req.response and getattr(key_req.response, "body", None):
+                                    key = key_req.response.body
                     except Exception:
                         pass
-                    if signed_query and "Key-Pair-Id=" not in key_url:
+                    key_url_raw = key_url
+                    key_url_signed = None
+                    if signed_query and "key=" not in key_url and "Key-Pair-Id=" not in key_url and "Policy=" not in key_url:
                         joiner = "&" if "?" in key_url else "?"
-                        key_url += joiner + signed_query.lstrip("?")
-                    key = key_cache.get(key_url) or key_cache.get(urlsplit(key_url).path) or locals().get("key")
+                        key_url_signed = key_url + joiner + signed_query.lstrip("?")
+                    key = key_cache.get(key_url_raw) or key_cache.get(urlsplit(key_url_raw).path)
                     if key is None:
-                        if key_req and key_req.response and key_req.response.body:
+                        if key_req and key_req.response and getattr(key_req.response, "body", None):
                             key = key_req.response.body
-                        else:
-                            key_resp = requests.get(url=key_url, headers=key_headers)
-                            if key_resp.status_code != 200:
-                                browser_key = self._fetch_key_via_browser(key_url)
+                        if key is None:
+                            tried = []
+                            for candidate in (key_req.url if key_req else None, key_url_raw, key_url_signed):
+                                if not candidate or candidate in tried:
+                                    continue
+                                tried.append(candidate)
+                                key_resp = session.get(url=candidate, headers=key_headers)
+                                if key_resp.status_code == 200 and key_resp.content:
+                                    key = key_resp.content
+                                    key_url = candidate
+                                    break
+                                browser_key = self._fetch_key_via_browser(candidate)
                                 if browser_key:
                                     key = browser_key
-                                else:
-                                    print(f"[KEY FAIL] {key_resp.status_code} {key_url}")
-                                    return None
-                            else:
-                                key = key_resp.content
+                                    key_url = candidate
+                                    break
+                            if key is None:
+                                last_url = tried[-1] if tried else key_url_raw
+                                safe_key_url = self._safe_ascii(last_url)
+                                resp_preview = ""
+                                try:
+                                    resp_preview = (key_resp.text or "")[:200]
+                                except Exception:
+                                    resp_preview = ""
+                                print(f"[KEY FAIL] status={getattr(key_resp, 'status_code', 'NA')} url={safe_key_url}")
+                                if resp_preview:
+                                    print(f"[KEY FAIL] body={self._safe_ascii(resp_preview)}")
+                                print(f"[KEY FAIL] segment={idx} seg_url={self._safe_ascii(seg_url)}")
+                                try:
+                                    os.makedirs("debug", exist_ok=True)
+                                    ts = time.strftime("%Y%m%d_%H%M%S")
+                                    dbg_path = os.path.join("debug", f"key_fail_{ts}.txt")
+                                    with open(dbg_path, "w", encoding="utf-8") as f:
+                                        f.write(f"key_url={key_url_raw}\n")
+                                        if key_url_signed:
+                                            f.write(f"key_url_signed={key_url_signed}\n")
+                                        f.write(f"segment={idx}\n")
+                                        f.write(f"seg_url={seg_url}\n")
+                                        f.write("cookies:\n")
+                                        try:
+                                            for c in self._driver.get_cookies():
+                                                f.write(f"  {c.get('name')}={c.get('value')}\n")
+                                        except Exception:
+                                            pass
+                                        f.write("recent key requests:\n")
+                                        for r in list(self._driver.requests)[-200:]:
+                                            if "/key/" in r.url:
+                                                f.write(f"  {r.url} status={getattr(r.response, 'status_code', None)}\n")
+                                    print(f"[KEY FAIL] saved debug: {dbg_path}")
+                                except Exception:
+                                    pass
+                                return False
                         key_cache[key_url] = key
                         key_cache[urlsplit(key_url).path] = key
+                    if key is None:
+                        print(f"[KEY FAIL] empty key: {self._safe_ascii(key_url)}")
+                        print(f"[KEY FAIL] segment={idx} seg_url={self._safe_ascii(seg_url)}")
+                        return False
                     if len(key) != 16:
                         print(f"[KEY FAIL] invalid key length: {len(key)}")
-                        return None
+                        print(f"[KEY FAIL] url={self._safe_ascii(key_url)}")
+                        print(f"[KEY FAIL] segment={idx} seg_url={self._safe_ascii(seg_url)}")
+                        return False
                     if iv is None:
                         iv = idx.to_bytes(16, "big")
                     if len(iv) != 16:
                         print("[KEY FAIL] invalid IV length")
-                        return None
+                        print(f"[KEY FAIL] segment={idx} seg_url={self._safe_ascii(seg_url)}")
+                        return False
                     try:
                         content = AES.new(key, AES.MODE_CBC, iv).decrypt(content)
                     except Exception as e:
                         print("[DECRYPT FAIL]", e)
-                        return None
+                        print(f"[DECRYPT FAIL] url={self._safe_ascii(key_url)}")
+                        print(f"[DECRYPT FAIL] segment={idx} seg_url={self._safe_ascii(seg_url)}")
+                        return False
                 videos.append(content)
             elif fail_shown < 3:
                 fail_shown += 1
@@ -749,7 +866,7 @@ class VideoCrawler:
             if not ffmpeg:
                 print("ffmpeg? ?? mp4? ??? ? ????. (INFLEARN_REMUX=1)")
                 print("  saved:", raw_path)
-                return None
+                return True
             out_path = os.path.join(src_path, course_filename)
             cmd = [ffmpeg, "-y", "-i", raw_path, "-c", "copy", out_path]
             try:
@@ -758,7 +875,7 @@ class VideoCrawler:
                 print("mp4 ?? ??:", out_path)
             except Exception as e:
                 print("mp4 ?? ??:", e)
-
+        return True
 
 if __name__ == '__main__':
     vc = VideoCrawler()
